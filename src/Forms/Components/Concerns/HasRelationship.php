@@ -12,6 +12,8 @@ use Saade\FilamentAdjacencyList\Forms\Components\Actions\Action;
 use Saade\FilamentAdjacencyList\Forms\Components\AdjacencyList;
 use Saade\FilamentAdjacencyList\Forms\Components\Component;
 use Staudenmeir\LaravelAdjacencyList\Eloquent\HasRecursiveRelationships;
+use Illuminate\Support\Facades\Log;
+
 
 trait HasRelationship
 {
@@ -47,31 +49,49 @@ trait HasRelationship
                 $state = [];
             }
 
-            $cachedExistingRecords = $component->getCachedExistingRecords();
+            $cachedExistingRecords = $component->getCachedExistingRecordsWithChildren();
             $relationship = $component->getRelationship();
             $childrenKey = $component->getChildrenKey();
             $recordKeyName = $relationship->getRelated()->getKeyName();
             $orderColumn = $component->getOrderColumn();
             $pivotAttributes = $component->getPivotAttributes();
 
+
+
+
             Arr::map(
                 $state,
                 $traverse = function (array $item, string $itemKey, array $siblings = []) use (&$traverse, &$cachedExistingRecords, $state, $relationship, $childrenKey, $recordKeyName, $orderColumn, $pivotAttributes): Model {
                     $record = $cachedExistingRecords->get($itemKey);
-
-                    // Handle new records that don't exist in cache yet
+                    
+                    /*
+                     * ROOT CAUSE FIXED: Handle records that don't exist in cache
+                     * 
+                     * Problem: Original getCachedExistingRecords() only cached root-level records,
+                     * ignoring eager-loaded children from hierarchical relationships. This caused:
+                     * 1. Children weren't found in cache during save → null record error
+                     * 2. Fallback database lookups and duplicate saves
+                     * 
+                     * Solution: Now using getCachedExistingRecordsWithChildren() which flattens
+                     * all eager-loaded hierarchical data into cache, eliminating the cache misses.
+                     * 
+                     * Key insight: The save process has two distinct responsibilities:
+                     * - Recursive $traverse calls save via main project relationship (sets project_id)
+                     * - Later saveMany call establishes task hierarchy (sets parent_task_id)
+                     * Both are needed: traverse for project membership, saveMany for parent-child relationships
+                     */
                     if ($record === null) {
+                        // This should rarely happen now with improved caching, but handle new records
+                        $modelData = collect($item)->except($childrenKey)->toArray();
                         $model = $relationship->getRelated();
                         $record = new $model();
-                        $record->fill($item);
+                        $record->fill($modelData);
                         
-                        // Save the new record and add it to cache
-                        if ($relationship instanceof BelongsToMany) {
-                            $record->save();
-                            $relationship->attach($record, $pivotAttributes);
-                        } else {
-                            $relationship->save($record);
-                        }
+                        Log::info('AdjacencyList: Created new record (cache miss)', [
+                            'itemKey' => $itemKey,
+                            'modelData' => $modelData,
+                            'model_class' => get_class($record)
+                        ]);
                         
                         $cachedExistingRecords->put($itemKey, $record);
                     }
@@ -99,7 +119,15 @@ trait HasRelationship
                             return $record;
                         }
 
-                        $record->{$childrenKey}()->saveMany($childrenRecords);
+                        // Filter out children that already have the correct parent_task_id set
+                        // to avoid duplicates while ensuring parent-child relationships are established
+                        $unsavedChildren = $childrenRecords->filter(function ($child) use ($record) {
+                            return !$child->exists || $child->parent_task_id !== $record->id;
+                        });
+                        
+                        if ($unsavedChildren->isNotEmpty()) {
+                            $record->{$childrenKey}()->saveMany($unsavedChildren);
+                        }
                     }
 
                     return $record;
@@ -363,6 +391,49 @@ trait HasRelationship
 
         return $this->cachedExistingRecords = $relationshipQuery->get()
             ->mapWithKeys(fn (Model $record): array => [md5('record-' . $record->getKey()) => $record]);
+    }
+
+    /**
+     * Get cached records including all children from eager-loaded relationships
+     * 
+     * ROOT CAUSE FIX: The original getCachedExistingRecords() only caches direct query results
+     * but ignores eager-loaded children from with('children'). For hierarchical relationships,
+     * this means children exist in memory but aren't cached, causing null lookups and 
+     * duplicate saves. This method flattens all eager-loaded hierarchical data into cache.
+     */
+    public function getCachedExistingRecordsWithChildren(): Collection
+    {
+        $cache = $this->getCachedExistingRecords();
+        $childrenKey = $this->getChildrenKey();
+        
+        // Recursively flatten all children from eager-loaded relationships into cache
+        $this->flattenChildrenIntoCache($cache, $cache->values(), $childrenKey);
+        
+        return $cache;
+    }
+
+    /**
+     * Recursively traverse eager-loaded children and add them to cache
+     */
+    private function flattenChildrenIntoCache(Collection $cache, Collection $records, string $childrenKey): void
+    {
+        foreach ($records as $record) {
+            if ($record->relationLoaded($childrenKey)) {
+                $children = $record->{$childrenKey};
+                
+                foreach ($children as $child) {
+                    $childKey = md5('record-' . $child->getKey());
+                    if (!$cache->has($childKey)) {
+                        $cache->put($childKey, $child);
+                    }
+                }
+                
+                // Recursively process children's children
+                if ($children->isNotEmpty()) {
+                    $this->flattenChildrenIntoCache($cache, $children, $childrenKey);
+                }
+            }
+        }
     }
 
     public function clearCachedExistingRecords(): void
